@@ -159,17 +159,8 @@ def restar_imagenes(img1, img2):
         r_b = m1[:, :, 2] - m2
         resultado = (r_r + r_g + r_b) / 3
 
-    min_val = np.min(resultado)
-    max_val = np.max(resultado)
-
-    # EVITAR DIVISIÓN POR CERO
-    if max_val - min_val == 0:
-        return np.zeros(resultado.shape, dtype=np.uint8)
-
-    # ESCALADO
-    resultado = (resultado - min_val) * (255.0 / (max_val - min_val))
-    
-    return resultado.astype(np.uint8)
+    # Retornamos el escalado
+    return _escalar_a_8bit(resultado)
 
 # --- ESTADÍSTICAS DE REGIÓN ---
 
@@ -239,7 +230,7 @@ def obtener_negativo(matriz_original):
 def obtener_histograma_gris(matriz_original):
     """
     Calcula el histograma normalizado (frecuencias relativas).
-    Retorna un arreglo de 256 elementos.
+    Retorna un arreglo de 256 elementos con valores float en el rango [0, 1].
     """
     if not _es_imagen_valida(matriz_original):
         raise ValueError("Imagen no soportada.")
@@ -262,7 +253,9 @@ def obtener_histograma_gris(matriz_original):
 
             # Incremento de la frecuencia del nivel detectado
             histograma[valor] += 1
-    return histograma
+
+    total_pixeles = alto * ancho
+    return histograma / total_pixeles
 
 # --- UMBRALIZACIÓN ---
 
@@ -291,6 +284,8 @@ def obtener_umbralizacion(matriz_original, umbral):
                 # Promedio de los 3 canales (R+G+B)/3
                 suma_canales = 0.0
                 for canal in range(3):
+
+                    # Convertimos explícitamente a float para evitar el overflow del uint8
                     suma_canales += float(matriz_original[y, x, canal])
                 valor_gris = suma_canales / 3
             else:
@@ -316,14 +311,24 @@ def ecualizar_histograma(matriz_original):
 
     histograma = obtener_histograma_gris(matriz_original)
     alto, ancho = matriz_original.shape[:2]
-    total_pixeles = alto * ancho
 
-    # Cálculo de la probabilidad acumulada
-    fda = np.zeros(256, dtype=float)
-    acumulado = 0
+    # Cálculo de la probabilidad acumulada (s_k)
+    probabilidad_acumulada = np.zeros(256, dtype=float)
+    acumulado = 0.0
     for i in range(256):
         acumulado += histograma[i]
-        fda[i] = acumulado / total_pixeles
+        probabilidad_acumulada[i] = acumulado
+
+    # Identificación de s_min (primer valor estrictamente mayor a cero)
+    probabilidad_minima = 0.0
+    for prob in probabilidad_acumulada:
+        if prob > 0:
+            probabilidad_minima = prob
+            break
+
+    # Evitar división por cero si la imagen es de un único color
+    if probabilidad_minima >= 1.0:
+        return matriz_original.copy()
 
     resultado = np.zeros_like(matriz_original)
 
@@ -332,11 +337,26 @@ def ecualizar_histograma(matriz_original):
         for x in range(ancho):
             if matriz_original.ndim == 3:
                 for canal in range(3):
-                    nuevo_valor = int(fda[matriz_original[y, x, canal]] * 255)
-                    resultado[y, x, canal] = max(0, min(255, nuevo_valor))
+                    # Nivel de gris actual de entrada
+                    gris_entrada = matriz_original[y, x, canal]
+
+                    # Aplicación de la fórmula discretizada con s_k y s_min
+                    valor_transformado = 255 * ((probabilidad_acumulada[gris_entrada] - probabilidad_minima) / (1.0 - probabilidad_minima))
+
+                    # Parte entera para obtener s_pico
+                    gris_salida = int(valor_transformado)
+                    resultado[y, x, canal] = max(0, min(255, gris_salida))
             else:
-                nuevo_valor = int(fda[matriz_original[y, x]] * 255)
-                resultado[y, x] = max(0, min(255, nuevo_valor))
+                # Nivel de gris actual de entrada
+                gris_entrada = matriz_original[y, x]
+
+                # Aplicación de la fórmula discretizada con s_k y s_min
+                valor_transformado = 255 * ((probabilidad_acumulada[gris_entrada] - probabilidad_minima) / (1.0 - probabilidad_minima))
+
+                # Parte entera para obtener s_pico
+                gris_salida = int(valor_transformado)
+                resultado[y, x] = max(0, min(255, gris_salida))
+
     return resultado
 
 # --- GENERADORES ALEATORIOS ---
@@ -629,7 +649,7 @@ def aplicar_filtro_gaussiano(matriz_original, sigma):
     # El tamaño de la máscara debe ser acorde al valor de σ
     # Se utiliza k = 2 * σ + 1
     tamano_mascara = int(2 * sigma + 1)
-    
+
     if tamano_mascara % 2 == 0:
         raise ValueError(f"El desvío (sigma={sigma}) debe generar una máscara de tamaño impar. Ingrese otro valor.")
 
@@ -639,13 +659,13 @@ def aplicar_filtro_gaussiano(matriz_original, sigma):
     alto, ancho = matriz_original.shape[:2]
 
     # Trabajamos en float32 para el cálculo
-    resultado = np.zeros(matriz_original.shape, dtype=np.float32)
+    resultado = matriz_original.astype(np.float32)
     matriz_float = matriz_original.astype(np.float32)
 
     # Navegación por la imagen (Ventana deslizante)
     for y in range(offset, alto - offset):
         for x in range(offset, ancho - offset):
-            
+
             if matriz_original.ndim == 3:  # Caso multicanal (RGB)
                 for canal in range(3):
                     acumulado = 0.0
@@ -661,7 +681,7 @@ def aplicar_filtro_gaussiano(matriz_original, sigma):
                     for mx in range(-offset, offset + 1):
                         acumulado += matriz_float[y + my, x + mx] * mascara[my + offset, mx + offset]
                 resultado[y, x] = acumulado
-    
+
     # Retornamos el escalado
     return _escalar_a_8bit(resultado)
 
@@ -709,21 +729,21 @@ def aplicar_filtro_realce_de_bordes(matriz_original, tamano_mascara):
     alto, ancho = matriz_original.shape[:2]
 
     # Matriz de salida en float para precisión en la suma de productos
-    resultado = np.zeros_like(matriz_original, dtype=np.float32)
+    resultado = matriz_original.astype(np.float32)
     matriz_float = matriz_original.astype(np.float32)
 
     # Navegación manual por la imagen (Ventana deslizante)
     for y in range(offset, alto - offset):
         for x in range(offset, ancho - offset):
-            
+
             if matriz_original.ndim == 3:  # Caso multicanal (RGB)
                 for canal in range(3):
                     acumulado = 0.0
-                    
+
                     # Convolución manual: suma de productos de la vecindad por pesos
                     for my in range(-offset, offset + 1):
                         for mx in range(-offset, offset + 1):
-                            
+
                             # (y + my, x + mx) define la posición en la imagen
                             # (my + offset, mx + offset) define la posición en la máscara
                             pixel_valor = matriz_float[y + my, x + mx, canal]
@@ -741,3 +761,4 @@ def aplicar_filtro_realce_de_bordes(matriz_original, tamano_mascara):
 
     # Retorno con escalado para preservar la integridad de las transiciones detectadas
     return _escalar_a_8bit(resultado)
+
