@@ -303,58 +303,72 @@ def obtener_umbralizacion(matriz_original, umbral):
 
 def ecualizar_histograma(matriz_original):
     """
-    Aplica la ecualización global basada en la probabilidad de ocurrencia de los niveles de gris.
-    s_k = T(r_k) = (L-1) * sum_{j=0}^{k} p_r(r_j)
+    Aplica la ecualización global del histograma.
+    El objetivo es mejorar el contraste redistribuyendo los niveles de gris 
+    para que el histograma resultante sea lo más plano (uniforme) posible.
+    Fórmula utilizada: s_k = round( (L-1) * (cdf(v) - cdf_min) / (1 - cdf_min) )
+    donde L = 256 niveles de gris.
     """
     if not _es_imagen_valida(matriz_original):
         raise ValueError("Imagen no soportada.")
 
+    # 1. Obtener el histograma normalizado (probabilidades relativas de cada nivel de gris)
     histograma = obtener_histograma_gris(matriz_original)
     alto, ancho = matriz_original.shape[:2]
 
-    # Cálculo de la probabilidad acumulada (s_k)
+    # 2. Calcular la Función de Distribución Acumulada (FDA o CDF en inglés)
+    # Básicamente suma las probabilidades desde el nivel 0 hasta el nivel actual 'i'.
     probabilidad_acumulada = np.zeros(256, dtype=float)
     acumulado = 0.0
     for i in range(256):
         acumulado += histograma[i]
         probabilidad_acumulada[i] = acumulado
 
-    # Identificación de s_min (primer valor estrictamente mayor a cero)
+    # 3. Identificar la "probabilidad mínima" mayor a cero (cdf_min)
+    # Esto es vital para asegurar que el nivel de gris más oscuro de la imagen original
+    # se asigne correctamente a 0 (negro puro) para aprovechar todo el espectro [0, 255].
     probabilidad_minima = 0.0
     for prob in probabilidad_acumulada:
         if prob > 0:
             probabilidad_minima = prob
             break
 
-    # Evitar división por cero si la imagen es de un único color
+    # Caso borde: Si toda la imagen es de un único color, la cdf_min será 1.0.
+    # En ese caso, la ecualización no tiene sentido, evitamos división por cero y devolvemos copia.
     if probabilidad_minima >= 1.0:
         return matriz_original.copy()
 
+    # 4. Crear la matriz vacía para guardar la nueva imagen ecualizada
     resultado = np.zeros_like(matriz_original)
 
-    # Mapeo de píxeles
+    # 5. Mapeo de píxeles: Recorremos toda la imagen original y reemplazamos sus valores
     for y in range(alto):
         for x in range(ancho):
-            if matriz_original.ndim == 3:
+            if matriz_original.ndim == 3:  # Caso imagen a color (RGB)
                 for canal in range(3):
-                    # Nivel de gris actual de entrada
+                    # Guardamos el nivel de gris original que tiene el píxel en este momento
                     gris_entrada = matriz_original[y, x, canal]
 
-                    # Aplicación de la fórmula discretizada con s_k y s_min
+                    # Aplicamos la fórmula matemática de ecualización.
+                    # Toma la probabilidad acumulada de ese color y la escala entre 0 y 255
                     valor_transformado = 255 * ((probabilidad_acumulada[gris_entrada] - probabilidad_minima) / (1.0 - probabilidad_minima))
 
-                    # Parte entera para obtener s_pico
+                    # Truncamos (cortamos los decimales) para que sea un número de nivel de gris válido
                     gris_salida = int(valor_transformado)
+                    
+                    # Lo guardamos asegurándonos de que nunca se pase del límite [0, 255]
                     resultado[y, x, canal] = max(0, min(255, gris_salida))
-            else:
-                # Nivel de gris actual de entrada
+            else:  # Caso imagen en escala de grises
+                # Guardamos el nivel de gris original del píxel
                 gris_entrada = matriz_original[y, x]
 
-                # Aplicación de la fórmula discretizada con s_k y s_min
+                # Aplicamos la fórmula matemática de ecualización
                 valor_transformado = 255 * ((probabilidad_acumulada[gris_entrada] - probabilidad_minima) / (1.0 - probabilidad_minima))
 
-                # Parte entera para obtener s_pico
+                # Truncamos los decimales
                 gris_salida = int(valor_transformado)
+                
+                # Lo guardamos limitando el valor
                 resultado[y, x] = max(0, min(255, gris_salida))
 
     return resultado
@@ -538,25 +552,70 @@ def aplicar_filtro_mediana(matriz_original, tamano_mascara):
 
 def generar_pesos_mediana_ponderada(tamano_mascara):
     """
-    Genera una matriz de pesos enteros basada en una distribución gaussiana.
-    El peso máximo está en el centro y decae hacia los bordes.
+    Genera una matriz de pesos enteros basada en una aproximación discreta
+    de la campana de Gauss utilizando coeficientes binomiales.
     """
-    # Crear cuadrícula centrada
-    radio = tamano_mascara // 2
-    eje = np.linspace(-radio, radio, tamano_mascara)
-    x, y = np.meshgrid(eje, eje)
+    n = tamano_mascara - 1
+    kernel_1d = np.zeros(tamano_mascara, dtype=int)
 
-    # Calcular importancia gaussiana
-    distancia_cuadrada = x**2 + y**2
-    sigma = tamano_mascara / 3
-    pesos = np.exp(-distancia_cuadrada / (2 * sigma**2))
+    # Generar el vector 1D iterativamente
+    valor = 1
+    for i in range(tamano_mascara):
+        kernel_1d[i] = valor
+        # Fórmula iterativa para el siguiente coeficiente binomial
+        valor = valor * (n - i) // (i + 1)
 
-    # Escalar para obtener repeticiones enteras (mínimo 1)
-    return (pesos / pesos.min()).astype(int)
+    # Generar la matriz 2D manualmente
+    pesos = np.zeros((tamano_mascara, tamano_mascara), dtype=int)
+    for y in range(tamano_mascara):
+        for x in range(tamano_mascara):
+            pesos[y, x] = kernel_1d[y] * kernel_1d[x]
+
+    return pesos
+
 
 # --- FILTRO DE LA MEDIANA PONDERADA ---
 
 def aplicar_filtro_mediana_ponderada(matriz_original, tamano_mascara):
+    """
+    Filtro de la mediana ponderada.
+    Halla la mediana de los valores del entorno repetidos según una matriz de pesos dinámicos.
+    """
+    if tamano_mascara % 2 == 0:
+        raise ValueError(f"El tamaño de la máscara debe ser impar.")
+
+    alto, ancho = matriz_original.shape[:2]
+    offset = tamano_mascara // 2
+    matriz_filtrada = matriz_original.copy()
+
+    # Generar la máscara de pesos basada en la importancia del píxel central
+    mascara_pesos = generar_pesos_mediana_ponderada(tamano_mascara)
+
+    for y in range(offset, alto - offset):
+        for x in range(offset, ancho - offset):
+            vecindad = matriz_original[y-offset:y+offset+1, x-offset:x+offset+1]
+
+            if matriz_original.ndim == 2:
+
+                # Caso niveles de gris
+                valores_expandidos = []
+                for i in range(tamano_mascara):
+                    for j in range(tamano_mascara):
+
+                        # Repetir el pixel tantas veces como indique su peso
+                        valores_expandidos.extend([vecindad[i, j]] * mascara_pesos[i, j])
+                matriz_filtrada[y, x] = np.median(valores_expandidos)
+            else:
+
+                # Caso RGB: Procesar cada canal por separado
+                for canal in range(3):
+                    valores_expandidos = []
+                    for i in range(tamano_mascara):
+                        for j in range(tamano_mascara):
+                            valores_expandidos.extend([vecindad[i, j, canal]] * mascara_pesos[i, j])
+                    matriz_filtrada[y, x, canal] = np.median(valores_expandidos)
+
+    return matriz_filtrada
     """
     Filtro de la mediana ponderada.
     Halla la mediana de los valores del entorno repetidos según una matriz de pesos dinámicos.
